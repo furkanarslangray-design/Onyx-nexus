@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  proxy-pool:
+    image: nginx:alpine
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./tier1.conf:/etc/nginx/tier1.conf:ro
+      - ./tier2.conf:/etc/nginx/tier2.conf:ro
+      - ./tier3.conf:/etc/nginx/tier3.conf:ro
+    restart: unless-stopped
+
+  session-rotator:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ./rotator:/app
+    command: python main.py
+    environment:
+      - ROTATION_INTERVAL=300
+      - TLS_FINGERPRINT=chrome120
+    restart: unless-stopped
