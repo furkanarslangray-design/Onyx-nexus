@@ -1,0 +1,72 @@
+version: '3.8'
+
+# GÜVENLİK İZOLASYONU: İki farklı ağ (network) kuruyoruz.
+networks:
+  nexus_net:
+    driver: bridge
+  sandbox_net:
+    driver: bridge
+    internal: true # DİKKAT: Bu ağın internet erişimi yoktur (Air-gapped)
+
+services:
+  # 1. TIER-3 KEYLESS PROXY HAVUZU
+  inference-proxy:
+    build: 
+      context: ./inference-proxy
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - ROTATION_INTERVAL=300
+      - TIER_ESCALATION_THRESHOLD=100
+    networks:
+      - nexus_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      retries: 3
+
+  # 2. DIŞ DÜNYA BAĞLANTILARI (MCP SERVERS)
+  mcp-hub:
+    build: 
+      context: ./mcp-servers
+      dockerfile: Dockerfile
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN} # .env dosyasından çekilecek
+      - NOTION_API_KEY=${NOTION_API_KEY}
+    networks:
+      - nexus_net
+    restart: unless-stopped
+
+  # 3. ANA BEYİN: CREWAI & LANGGRAPH
+  orchestrator:
+    build: 
+      context: ./orchestration
+      dockerfile: Dockerfile
+    environment:
+      - OPENAI_API_BASE=http://inference-proxy:8000/v1
+      - OPENAI_API_KEY=sk-nexus-keyless-proxy
+    depends_on:
+      inference-proxy:
+        condition: service_healthy # Proxy ayağa kalkmadan beyin çalışmaz
+      mcp-hub:
+        condition: service_started
+    volumes:
+      - ./orchestration:/app # Canlı kod güncellemesi için
+      - ./docs:/docs # Çıktı raporları için
+    networks:
+      - nexus_net
+      - sandbox_net # Beyin, her iki ağa da bağlıdır
+    restart: always
+
+  # 4. İZOLE KOD ÇALIŞTIRMA ORTAMI (E2B / DOCKER IN DOCKER)
+  sandbox-executor:
+    build: 
+      context: ./sandbox/e2b
+      dockerfile: Dockerfile
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock # Alt container üretebilmesi için şart
+    networks:
+      - sandbox_net # Sadece internal ağdadır, proxy'ye sızamaz
+    restart: unless-stopped
