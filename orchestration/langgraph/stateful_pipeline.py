@@ -6,7 +6,7 @@ Implements circuit breaker pattern with 3-strike rule and state persistence.
 
 import json
 import sqlite3
-from typing import TypedDict, Annotated, List, Dict, Any, Optional
+from typing import TypedDict, Annotated, List, Dict, Any
 from dataclasses import dataclass
 from datetime import datetime
 import operator
@@ -27,8 +27,8 @@ class PipelineState(TypedDict):
 class StageResult:
     success: bool
     output: Any = None
-    error: Optional[str] = None
-    next_stage: Optional[str] = None
+    error: str = None
+    next_stage: str = None
 
 
 class CircuitBreaker:
@@ -49,7 +49,7 @@ class CircuitBreaker:
 
         try:
             result = func(*args, **kwargs)
-            self.failure_counts[stage_name] = 0  # Reset on success
+            self.failure_counts[stage_name] = 0
             return StageResult(success=True, output=result)
         except Exception as e:
             self.failure_counts[stage_name] = self.failure_counts.get(stage_name, 0) + 1
@@ -65,12 +65,13 @@ class CircuitBreaker:
 
 
 class StatefulPipeline:
-    """LangGraph-inspired stateful execution pipeline."""
+    """LangGraph-inspired stateful execution pipeline with ordered stages."""
 
     def __init__(self, db_path: str = "pipeline_state.db"):
         self.db_path = db_path
         self.circuit_breaker = CircuitBreaker(max_retries=3)
         self.stages: Dict[str, callable] = {}
+        self._stage_sequence: List[str] = []
         self._init_db()
 
     def _init_db(self) -> None:
@@ -80,22 +81,24 @@ class StatefulPipeline:
             CREATE TABLE IF NOT EXISTS pipeline_runs (
                 task_id TEXT PRIMARY KEY,
                 state JSON,
-                created_at TIMESTAMP,
-                updated_at TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         conn.commit()
         conn.close()
 
     def register_stage(self, name: str, func: callable) -> None:
-        """Register pipeline stage."""
+        """Register pipeline stage with explicit ordering."""
         self.stages[name] = func
+        if name not in self._stage_sequence:
+            self._stage_sequence.append(name)
 
     def execute(self, task_id: str, initial_data: Dict[str, Any]) -> PipelineState:
         """Execute pipeline with state persistence."""
         state: PipelineState = {
             "task_id": task_id,
-            "current_stage": "start",
+            "current_stage": self._stage_sequence[0] if self._stage_sequence else "end",
             "data": initial_data,
             "errors": [],
             "retry_count": {},
@@ -115,7 +118,6 @@ class StatefulPipeline:
                 })
                 break
 
-            # Execute with circuit breaker
             result = self.circuit_breaker.call(
                 self.stages[stage_name],
                 stage_name,
@@ -135,7 +137,6 @@ class StatefulPipeline:
                 if result.next_stage == "error_handler":
                     state["current_stage"] = "error_handler"
                 else:
-                    # Retry same stage
                     state["retry_count"][stage_name] = state["retry_count"].get(stage_name, 0) + 1
 
             self._save_state(state)
@@ -143,32 +144,31 @@ class StatefulPipeline:
         return state
 
     def _get_next_stage(self, current: str) -> str:
-        """Determine next stage (to be overridden by DAG definition)."""
-        # Default: linear progression
-        stage_sequence = list(self.stages.keys())
+        """Determine next stage using explicit sequence."""
         try:
-            idx = stage_sequence.index(current)
-            return stage_sequence[idx + 1] if idx + 1 < len(stage_sequence) else "end"
+            idx = self._stage_sequence.index(current)
+            return self._stage_sequence[idx + 1] if idx + 1 < len(self._stage_sequence) else "end"
         except ValueError:
             return "end"
 
     def _save_state(self, state: PipelineState) -> None:
-        """Persist state to SQLite."""
+        """Persist state to SQLite, preserving created_at."""
         conn = sqlite3.connect(self.db_path)
         conn.execute("""
-            INSERT OR REPLACE INTO pipeline_runs (task_id, state, created_at, updated_at)
-            VALUES (?, ?, COALESCE((SELECT created_at FROM pipeline_runs WHERE task_id = ?), ?), ?)
+            INSERT INTO pipeline_runs (task_id, state, created_at, updated_at)
+            VALUES (?, ?, COALESCE((SELECT created_at FROM pipeline_runs WHERE task_id = ?), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)
+            ON CONFLICT(task_id) DO UPDATE SET
+                state = excluded.state,
+                updated_at = CURRENT_TIMESTAMP
         """, (
             state["task_id"],
             json.dumps(state, default=str),
-            state["task_id"],
-            datetime.now(),
-            datetime.now()
+            state["task_id"]
         ))
         conn.commit()
         conn.close()
 
-    def load_state(self, task_id: str) -> Optional[PipelineState]:
+    def load_state(self, task_id: str) -> PipelineState:
         """Load persisted state."""
         conn = sqlite3.connect(self.db_path)
         row = conn.execute(
@@ -180,38 +180,30 @@ class StatefulPipeline:
         return json.loads(row[0]) if row else None
 
 
-# Example: Code generation pipeline with error recovery
+# Example usage
 def example_pipeline():
     pipeline = StatefulPipeline()
 
-    # Define stages
     def analyze_requirements(state: PipelineState) -> Dict:
-        """Analyze and decompose requirements."""
         return {"requirements": state["data"].get("requirements", [])}
 
     def generate_code(state: PipelineState) -> Dict:
-        """Generate implementation."""
-        # Simulate occasional failure for circuit breaker demo
         import random
         if random.random() < 0.3:
             raise Exception("LLM inference timeout")
         return {"code": "# generated code"}
 
     def test_code(state: PipelineState) -> Dict:
-        """Run tests."""
         return {"tests_passed": True}
 
     def error_handler(state: PipelineState) -> Dict:
-        """Handle errors after 3 strikes."""
         return {"fallback": "use_cached_result"}
 
-    # Register stages
     pipeline.register_stage("analyze", analyze_requirements)
     pipeline.register_stage("generate", generate_code)
     pipeline.register_stage("test", test_code)
     pipeline.register_stage("error_handler", error_handler)
 
-    # Execute
     result = pipeline.execute(
         task_id="task_001",
         initial_data={"requirements": ["Implement auth", "Add logging"]}

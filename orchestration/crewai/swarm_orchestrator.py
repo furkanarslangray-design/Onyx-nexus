@@ -7,21 +7,22 @@ distributes across specialized workers, aggregates outputs.
 
 import os
 import json
-import asyncio
-from typing import List, Dict, Any, Optional, Callable
+import time
+import threading
+from typing import List, Dict, Any, Optional, Callable, Set
 from dataclasses import dataclass, field
 from enum import Enum
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import networkx as nx
 
 
 class AgentRole(Enum):
-    ARCHITECT = "architect"      # System design, DAG construction
-    CODER = "coder"              # Implementation, code generation
-    REVIEWER = "reviewer"        # Code review, security audit
-    TESTER = "tester"            # Test generation, execution
-    RESEARCHER = "researcher"    # Documentation, API research
-    OPTIMIZER = "optimizer"      # Performance tuning
+    ARCHITECT = "architect"
+    CODER = "coder"
+    REVIEWER = "reviewer"
+    TESTER = "tester"
+    RESEARCHER = "researcher"
+    OPTIMIZER = "optimizer"
 
 
 @dataclass
@@ -32,7 +33,7 @@ class Task:
     dependencies: List[str] = field(default_factory=list)
     inputs: Dict[str, Any] = field(default_factory=dict)
     outputs: Dict[str, Any] = field(default_factory=dict)
-    status: str = "pending"  # pending, running, completed, failed
+    status: str = "pending"
     retries: int = 0
     max_retries: int = 3
 
@@ -45,8 +46,7 @@ class WorkerAgent:
     max_tokens: int = 4096
 
     def execute(self, task: Task) -> Dict[str, Any]:
-        """Execute task via LLM inference."""
-        # Circuit breaker: 3-strike rule
+        """Execute task via LLM inference with circuit breaker."""
         for attempt in range(task.max_retries):
             try:
                 result = self._call_llm(task)
@@ -100,7 +100,7 @@ class WorkerAgent:
 
 
 class SwarmOrchestrator:
-    """DAG-based multi-agent orchestrator."""
+    """DAG-based multi-agent orchestrator with dependency-aware execution."""
 
     def __init__(self, max_workers: int = 4):
         self.tasks: Dict[str, Task] = {}
@@ -109,6 +109,8 @@ class SwarmOrchestrator:
             role: WorkerAgent(role=role) for role in AgentRole
         }
         self.max_workers = max_workers
+        self._completed: Set[str] = set()
+        self._lock = threading.Lock()
 
     def add_task(self, task: Task) -> None:
         """Add task to DAG."""
@@ -126,42 +128,51 @@ class SwarmOrchestrator:
             raise ValueError("Cycle detected in task DAG")
 
     def execute(self, callback: Optional[Callable] = None) -> Dict[str, Any]:
-        """Execute all tasks in DAG order with parallelization."""
+        """Execute all tasks with dependency-aware parallelization."""
         execution_order = self.topological_sort()
-        results = {}
+        results: Dict[str, Any] = {}
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {}
+            futures: Dict[str, Any] = {}
+            submitted: Set[str] = set()
 
-            for task_id in execution_order:
-                task = self.tasks[task_id]
+            while len(submitted) < len(execution_order):
+                for task_id in execution_order:
+                    if task_id in submitted:
+                        continue
 
-                # Wait for dependencies
-                deps_completed = all(
-                    self.tasks[dep].status == "completed"
-                    for dep in task.dependencies
-                )
+                    task = self.tasks[task_id]
+                    deps_completed = all(
+                        dep in self._completed for dep in task.dependencies
+                    )
 
-                if not deps_completed:
-                    task.status = "failed"
-                    results[task_id] = {
-                        "status": "failed",
-                        "error": "dependency_failed"
-                    }
-                    continue
+                    if deps_completed:
+                        agent = self.agents[task.role]
+                        future = executor.submit(agent.execute, task)
+                        futures[task_id] = future
+                        submitted.add(task_id)
 
-                # Submit to thread pool
-                agent = self.agents[task.role]
-                future = executor.submit(agent.execute, task)
-                futures[task_id] = future
+                # Collect completed futures
+                done = [tid for tid, fut in futures.items() if fut.done()]
+                for tid in done:
+                    if tid not in self._completed:
+                        result = futures[tid].result()
+                        results[tid] = result
+                        with self._lock:
+                            self._completed.add(tid)
+                        if callback:
+                            callback(tid, result)
+                        del futures[tid]
 
-            # Collect results
+                if not done:
+                    time.sleep(0.1)
+
+            # Collect any remaining
             for task_id, future in futures.items():
                 result = future.result()
                 results[task_id] = result
-
-                if callback:
-                    callback(task_id, result)
+                with self._lock:
+                    self._completed.add(task_id)
 
         return results
 
@@ -169,16 +180,13 @@ class SwarmOrchestrator:
         """Identify critical path for optimization."""
         if not self.graph.edges:
             return []
-
-        longest_path = nx.dag_longest_path(self.graph)
-        return longest_path
+        return nx.dag_longest_path(self.graph)
 
 
 def example_usage():
     """Example: Multi-agent code generation pipeline."""
     orchestrator = SwarmOrchestrator(max_workers=4)
 
-    # Define DAG
     tasks = [
         Task(id="design", description="Design system architecture", role=AgentRole.ARCHITECT),
         Task(id="implement", description="Implement core modules", role=AgentRole.CODER, dependencies=["design"]),
@@ -193,14 +201,12 @@ def example_usage():
     print(f"Execution order: {orchestrator.topological_sort()}")
     print(f"Critical path: {orchestrator.get_critical_path()}")
 
-    # Execute with progress callback
     def progress_callback(task_id: str, result: Dict):
         status = result.get("status")
         print(f"[{status.upper()}] {task_id}")
 
     results = orchestrator.execute(callback=progress_callback)
 
-    # Summary
     successful = sum(1 for r in results.values() if r.get("status") == "success")
     print(f"\nCompleted: {successful}/{len(results)} tasks")
 

@@ -6,7 +6,8 @@ Provides tools for repository operations, issue tracking, and code search.
 
 import os
 import json
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List
 from dataclasses import dataclass
 
 import requests
@@ -33,17 +34,20 @@ class GitHubClient:
         })
 
     def _request(self, method: str, endpoint: str, **kwargs) -> Dict:
-        """Request with rate limit retry."""
+        """Request with rate limit retry respecting Retry-After header."""
         url = f"{self.config.base_url}{endpoint}"
 
         for attempt in range(3):
             response = self.session.request(method, url, **kwargs)
 
-            if response.status_code == 403 and "rate limit" in response.text.lower():
-                # Exponential backoff
-                import time
-                time.sleep(2 ** attempt)
-                continue
+            if response.status_code == 403:
+                retry_after = response.headers.get("Retry-After")
+                if retry_after:
+                    time.sleep(int(retry_after))
+                    continue
+                elif "rate limit" in response.text.lower():
+                    time.sleep(2 ** attempt)
+                    continue
 
             response.raise_for_status()
             return response.json()

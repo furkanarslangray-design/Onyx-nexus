@@ -9,9 +9,11 @@ import time
 import json
 import random
 import hashlib
+import hmac
+import secrets
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -23,14 +25,19 @@ class ProxySession:
     created_at: datetime
     expires_at: datetime
     request_count: int = 0
+    _secret_key: bytes = field(default_factory=lambda: secrets.token_bytes(32))
 
     def is_expired(self) -> bool:
         return datetime.now() > self.expires_at
 
     def rotate_token(self) -> None:
-        """Generate new session token with jitter."""
-        entropy = f"{self.endpoint}{time.time()}{random.random()}"
-        self.session_token = hashlib.sha256(entropy.encode()).hexdigest()[:32]
+        """Generate new session token with cryptographic security."""
+        entropy = f"{self.endpoint}{time.time()}{secrets.token_hex(16)}".encode()
+        self.session_token = hmac.new(
+            self._secret_key,
+            entropy,
+            hashlib.sha256
+        ).hexdigest()[:32]
         self.created_at = datetime.now()
         self.expires_at = datetime.now() + timedelta(
             seconds=int(os.getenv("ROTATION_INTERVAL", "300"))
@@ -49,6 +56,7 @@ class ProxyPoolManager:
     def __init__(self):
         self.sessions: Dict[int, List[ProxySession]] = {1: [], 2: [], 3: []}
         self.active_tier = 1
+        self._request_threshold = int(os.getenv("TIER_ESCALATION_THRESHOLD", "100"))
         self._init_pool()
 
     def _init_pool(self) -> None:
@@ -73,12 +81,11 @@ class ProxyPoolManager:
                 self.sessions[tier].append(session)
 
     def get_session(self, tier: Optional[int] = None) -> ProxySession:
-        """Get active session for tier, with fallback."""
+        """Get active session for tier, with fallback and recovery."""
         target_tier = tier or self.active_tier
         available = [s for s in self.sessions[target_tier] if not s.is_expired()]
 
         if not available:
-            # Rotate all expired sessions in tier
             for s in self.sessions[target_tier]:
                 if s.is_expired():
                     s.rotate_token()
@@ -87,9 +94,10 @@ class ProxyPoolManager:
         session = random.choice(available)
         session.request_count += 1
 
-        # Tier escalation on high request count
-        if session.request_count > 100 and target_tier < 3:
+        # Tier escalation with counter reset to allow Tier 1 recovery
+        if session.request_count > self._request_threshold and target_tier < 3:
             self.active_tier = target_tier + 1
+            session.request_count = 0
 
         return session
 
@@ -101,7 +109,8 @@ class ProxyPoolManager:
             status[f"tier{tier}"] = {
                 "total": len(sessions),
                 "active": active,
-                "total_requests": sum(s.request_count for s in sessions)
+                "total_requests": sum(s.request_count for s in sessions),
+                "active_tier": self.active_tier
             }
         return status
 
@@ -115,7 +124,6 @@ def main():
 
     while True:
         try:
-            # Periodic rotation check
             for tier_sessions in manager.sessions.values():
                 for session in tier_sessions:
                     if session.is_expired():
